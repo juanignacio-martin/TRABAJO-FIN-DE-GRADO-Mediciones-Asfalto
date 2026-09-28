@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<!--
+==========================================
+INTERFAZ WEB — PCB2 (7index.html)
+==========================================
+
+Proyecto: Digital-PAVE (TED2021-131474B-I00)
+Autor:    Juan Ignacio Martín Moreno
+Tutor:    Giuseppe Conti (ETSIDI-UPM)
+Cotutor:  Federico Gulisano (ETSICCP-UPM)
+
+Descripción:
+  Interfaz web del sistema de adquisición para la PCB2. Se sirve al
+  navegador del operador desde el servidor FastAPI de la Raspberry Pi
+  (ruta GET "/") y se comunica con él en tiempo real por WebSocket ("/ws"),
+  con mensajes JSON en ambos sentidos.
+
+Diferencias respecto a la interfaz de la PCB1 (4index.html):
+  1. Panel de topología: el operador declara la posición real de los
+     jumpers de la placa (JP3, JP4, JP5, JP6, JP7). La Raspberry Pi
+     necesita conocerla para aplicar el algoritmo de cálculo correcto
+     sobre los voltajes crudos que le llegan de los Arduinos. Si lo
+     declarado no coincide con la posición física de los jumpers, los
+     resultados carecen de sentido físico.
+  2. Las gráficas se reconstruyen según la topología seleccionada
+     (una cadena de 14, o dos cadenas de 8 y 6; 7 u 8 canales en paralelo).
+  3. Tres modalidades de grabación independientes: datos (CSV), pantalla
+     y cámara, que pueden activarse por separado o de forma simultánea.
+
+Mensajes WebSocket (formato JSON):
+  Servidor → navegador (~30 Hz):
+     estado completo del sistema (resistencias, Hz de cada Arduino,
+     configuración activa, estado de grabación).
+  Servidor → navegador (al detener la grabación):
+     { "tipo": "csv_export", "contenido": "<texto CSV>" }
+  Navegador → servidor:
+     { "accion": "configurar_topologia", ... }
+     { "accion": "configurar_canales", ... }
+     { "accion": "iniciar_grabacion" }
+     { "accion": "detener_grabacion" }
+
+Dependencias externas (CDN):
+  uPlot — https://unpkg.com/uplot
+  Requiere conexión a Internet en el equipo que abre la interfaz para
+  cargar la biblioteca (la Raspberry Pi solo sirve el HTML).
+==========================================
+-->
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Telemetría Asfalto TFG — PCB2 Completa</title>
+
+    <!-- uPlot: hoja de estilos y biblioteca de gráficas (canvas) -->
+    <link rel="stylesheet" href="https://unpkg.com/uplot/dist/uPlot.min.css">
+    <script src="https://unpkg.com/uplot/dist/uPlot.iife.min.js"></script>
+    <style>
+        /* Tema oscuro general */
+        body { background-color: #121212; color: #ffffff; font-family: 'Segoe UI', Tahoma, sans-serif; margin: 0; padding: 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #333; padding-bottom: 10px; margin-bottom: 20px; }
+        .header h1 { margin: 0; color: #4CAF50; font-size: 1.3em; }
+        /* Indicador de conexión WebSocket: rojo desconectado, verde conectado */
+        .status { padding: 8px 15px; border-radius: 5px; font-weight: bold; background-color: #f44336; }
+        .status.connected { background-color: #4CAF50; }
+
+        /* Panel de configuración de topología (jumpers) */
+        .panel-box { background: #1e1e1e; padding: 15px 20px; border-radius: 8px; border: 1px solid #333; margin-bottom: 20px; }
+        .panel-box h3 { margin-top: 0; color: #FFC107; border-bottom: 1px solid #333; padding-bottom: 8px; margin-bottom: 15px; font-size: 1em; }
+
+        /* Una tarjeta por jumper; la rejilla se adapta al ancho disponible */
+        .topo-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; }
+        .topo-group { background: #252525; padding: 12px; border-radius: 6px; }
+        .topo-group label.titulo { display: block; font-size: 0.85em; color: #aaa; margin-bottom: 8px; font-weight: bold; }
+        .topo-opcion { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; font-size: 0.9em; cursor: pointer; }
+        .topo-opcion input[type="radio"] { cursor: pointer; }
+        .campo-numerico { width: 60px; padding: 3px 6px; background: #2a2a2a; border: 1px solid #555; color: white; border-radius: 3px; margin-left: 6px; }
+
+        .btn-aplicar { background: #03A9F4; color: white; border: none; padding: 8px 20px; border-radius: 5px; font-weight: bold; cursor: pointer; margin-top: 10px; }
+        .btn-aplicar:hover { background: #0288d1; }
+
+        /* Barra de canales activos y monitor de frecuencia */
+        .controls { background: #1e1e1e; padding: 15px; border-radius: 8px; border: 1px solid #333; margin-bottom: 20px; display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
+        .controls input { width: 50px; padding: 5px; background: #2a2a2a; border: 1px solid #555; color: white; text-align: center; font-weight: bold; border-radius: 4px; }
+        .hz-monitor { background: #2a2a2a; padding: 8px 15px; border-radius: 5px; font-family: monospace; color: #FFEB3B; font-size: 1.1em; margin-left: auto; }
+
+        /* Barra de grabación: tres grupos independientes (datos, pantalla, cámara) */
+        .rec-bar { background: #1e1e1e; border: 1px solid #333; border-radius: 8px; padding: 15px 20px; margin-bottom: 20px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+        .rec-grupo { display: flex; align-items: center; gap: 10px; padding-right: 16px; border-right: 1px solid #333; }
+        .rec-grupo:last-of-type { border-right: none; }
+        .btn-rec { padding: 9px 20px; border-radius: 6px; border: none; font-size: 0.9em; font-weight: bold; cursor: pointer; }
+        .btn-rec.iniciar { background: #4CAF50; color: #fff; }
+        .btn-rec.detener { background: #f44336; color: #fff; }
+        .rec-dot { width: 10px; height: 10px; border-radius: 50%; background: #555; display: inline-block; }
+        .rec-dot.activo { background: #f44336; }
+        .cronometro { font-family: monospace; font-size: 1.1em; color: #FFEB3B; min-width: 46px; }
+        /* Vista previa de la cámara: oculta hasta que se inicia la grabación */
+        #camara-preview { width: 120px; border-radius: 6px; border: 1px solid #444; display: none; }
+
+        /* Cajas numéricas con el valor instantáneo de cada resistencia */
+        .grid-container { display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; }
+        .panel { background: #1e1e1e; padding: 15px; border-radius: 8px; flex: 1; border: 1px solid #333; min-width: 200px; }
+        .panel h3 { margin-top: 0; color: #FFC107; border-bottom: 1px solid #333; padding-bottom: 5px; }
+        .data-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 8px; }
+        .data-box { background: #2a2a2a; padding: 8px; border-radius: 5px; text-align: center; }
+        .data-box .label { font-size: 0.75em; color: #aaa; }
+        .data-box .value { font-size: 1.1em; font-weight: bold; margin-top: 3px; color: #03A9F4; }
+        /* Contenedores de las gráficas uPlot */
+        .chart-container { background: #1e1e1e; padding: 15px; border-radius: 8px; border: 1px solid #333; margin-bottom: 20px; }
+        .chart-container h3 { margin-top: 0; color: #FFC107; border-bottom: 1px solid #333; padding-bottom: 5px; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+
+<!-- Cabecera: título y estado de la conexión WebSocket -->
+<div class="header">
+    <h1>Sistema de Adquisición — PCB2 Completa TFG</h1>
+    <div id="connection-status" class="status">Desconectado</div>
+</div>
+
+<!--
+    PANEL DE TOPOLOGÍA (jumpers físicos)
+    Cada tarjeta refleja un jumper de la PCB2. Estos controles NO
+    modifican el hardware: sirven para declarar al software en qué
+    posición está cada jumper. Los cambios no se aplican al instante,
+    sino al pulsar "Aplicar Topología", para no dejar el sistema en un
+    estado intermedio mientras el operador ajusta varios campos.
+-->
+<div class="panel-box">
+    <h3>Configuración de topología (jumpers de la PCB)</h3>
+    <div class="topo-grid">
+
+        <!-- JP6: cadena serie única de 14 resistencias, o dos cadenas
+             independientes de 8 y 6 -->
+        <div class="topo-group">
+            <label class="titulo">Modo cadena serie (JP6)</label>
+            <label class="topo-opcion"><input type="radio" name="modo_serie" value="8_6" checked> Dos cadenas (8R + 6R)</label>
+            <label class="topo-opcion"><input type="radio" name="modo_serie" value="14"> Cadena única (14R)</label>
+        </div>
+
+        <!-- JP7: en el canal AIN0 de U9 se mide la tensión de alimentación
+             real de los divisores (7 canales de asfalto) o se usa ese
+             canal como una medida más (8 canales) con V_REF constante -->
+        <div class="topo-group">
+            <label class="titulo">Modo paralelo (JP7)</label>
+            <label class="topo-opcion"><input type="radio" name="modo_paralelo" value="vref" checked> 7R + V_REF en tiempo real</label>
+            <label class="topo-opcion">
+                <input type="radio" name="modo_paralelo" value="fija"> 8R + V_REF fija
+                <input type="number" step="0.01" id="inp-vref-fija" class="campo-numerico" value="3.41">V
+            </label>
+        </div>
+
+        <!-- JP5: resistencia de referencia al inicio de la cadena serie
+             (sensor de corriente). Fija de placa o valor personalizado -->
+        <div class="topo-group">
+            <label class="titulo">R_ref inicio de cadena (JP5)</label>
+            <label class="topo-opcion"><input type="radio" name="jp5" value="fija" checked> Fija de placa (10,1 Ω)</label>
+            <label class="topo-opcion">
+                <input type="radio" name="jp5" value="custom"> Personalizada
+                <input type="number" step="0.1" id="inp-rref-jp5" class="campo-numerico" value="10.1">Ω
+            </label>
+        </div>
+
+        <!-- JP3: resistencia de referencia de la segunda cadena (6R),
+             solo relevante en modo de dos cadenas independientes -->
+        <div class="topo-group">
+            <label class="titulo">R_ref cadena 6 (JP3)</label>
+            <label class="topo-opcion"><input type="radio" name="jp3" value="fija" checked> Fija de placa (10,1 Ω)</label>
+            <label class="topo-opcion">
+                <input type="radio" name="jp3" value="custom"> Personalizada
+                <input type="number" step="0.1" id="inp-rref-jp3" class="campo-numerico" value="10.1">Ω
+            </label>
+        </div>
+
+        <!-- JP4: cierre del extremo final de la segunda cadena a través de
+             una resistencia conocida (sin usar, soldada en placa, o
+             personalizada). Permite corregir la corriente derivada -->
+        <div class="topo-group">
+            <label class="titulo">JP4 (calibración final)</label>
+            <label class="topo-opcion"><input type="radio" name="jp4" value="sin_usar" checked> Sin usar</label>
+            <label class="topo-opcion"><input type="radio" name="jp4" value="soldada"> R_ref soldada</label>
+            <label class="topo-opcion">
+                <input type="radio" name="jp4" value="personalizada"> Personalizada
+                <input type="number" step="0.1" id="inp-r-jp4" class="campo-numerico" value="0">Ω
+            </label>
+        </div>
+
+    </div>
+    <button id="btn-aplicar-topo" class="btn-aplicar">Aplicar Topología</button>
+</div>
+
+<!--
+    PANEL DE CANALES ACTIVOS
+    Número de resistencias que se calculan y muestran en cada
+    configuración. Permite medir solo un tramo de la cadena: el operador
+    traslada el GND al borne correspondiente al último canal deseado y
+    lo declara aquí. Los Arduinos siguen midiendo los 8 canales; el
+    recorte es solo de cálculo y visualización en la Raspberry Pi.
+    El monitor de Hz muestra la frecuencia real de cada Arduino.
+-->
+<div class="controls">
+    <label>Serie 14: <input type="number" id="inp-serie14" min="1" max="14" value="14"></label>
+    <label>Serie 8: <input type="number" id="inp-serie8" min="1" max="8" value="8"></label>
+    <label>Serie 6: <input type="number" id="inp-serie6" min="1" max="6" value="6"></label>
+    <label>Paralelo: <input type="number" id="inp-paralelo" min="1" max="8" value="7"></label>
+    <button id="btn-aplicar-canales" class="btn-aplicar">Aplicar Canales</button>
+    <div id="hz-monitor" class="hz-monitor">A1: 0 Hz | A2: 0 Hz | A3: 0 Hz</div>
+</div>
+
+<!--
+    BARRA DE GRABACIÓN: CSV + Pantalla + Cámara
+    Tres controles independientes, cada uno con su indicador y su
+    cronómetro. El CSV lo genera el servidor; la grabación de pantalla
+    y de cámara las realiza el propio navegador con las API
+    getDisplayMedia y getUserMedia, sin intervención del servidor.
+-->
+<div class="rec-bar">
+    <div class="rec-grupo">
+        <span class="rec-dot" id="rec-dot"></span>
+        <button id="btn-rec" class="btn-rec iniciar">Iniciar Grabación</button>
+        <div class="cronometro" id="cronometro">00:00</div>
+    </div>
+    <div class="rec-grupo">
+        <span class="rec-dot" id="dot-pantalla"></span>
+        <button id="btn-pantalla" class="btn-rec iniciar">Grabar Pantalla</button>
+        <div class="cronometro" id="pantalla-crono">00:00</div>
+    </div>
+    <div class="rec-grupo">
+        <span class="rec-dot" id="dot-camara"></span>
+        <button id="btn-camara" class="btn-rec iniciar">Grabar Cámara</button>
+        <div class="cronometro" id="camara-crono">00:00</div>
+        <video id="camara-preview" autoplay muted></video>
+    </div>
+</div>
+
+<!--
+    CAJAS NUMÉRICAS
+    Valor instantáneo de cada resistencia en ohmios. Según el modo de
+    cadena serie seleccionado se muestra el panel de 14 resistencias o
+    los dos paneles de 8 y 6 (el resto queda oculto).
+-->
+<div class="grid-container">
+    <div class="panel" id="panel-serie14" style="display:none;">
+        <h3>Cadena Serie Única — 14R (Ω)</h3>
+        <div id="grid-serie14" class="data-grid"></div>
+    </div>
+    <div class="panel" id="panel-serie8">
+        <h3>Cadena Serie 1 — 8R (Ω)</h3>
+        <div id="grid-serie8" class="data-grid"></div>
+    </div>
+    <div class="panel" id="panel-serie6">
+        <h3>Cadena Serie 2 — 6R (Ω)</h3>
+        <div id="grid-serie6" class="data-grid"></div>
+    </div>
+    <div class="panel">
+        <h3>Paralelo (Ω)</h3>
+        <div id="grid-paralelo" class="data-grid"></div>
+    </div>
+</div>
+
+<!-- GRÁFICAS: evolución temporal de cada configuración (uPlot) -->
+<div class="chart-container" id="chartbox-serie14" style="display:none;">
+    <h3>Evolución — Cadena Serie Única (14R)</h3>
+    <div id="chart-serie14"></div>
+</div>
+<div class="chart-container" id="chartbox-serie8">
+    <h3>Evolución — Cadena Serie 1 (8R)</h3>
+    <div id="chart-serie8"></div>
+</div>
+<div class="chart-container" id="chartbox-serie6">
+    <h3>Evolución — Cadena Serie 2 (6R)</h3>
+    <div id="chart-serie6"></div>
+</div>
+<div class="chart-container">
+    <h3>Evolución — Paralelo</h3>
+    <div id="chart-paralelo"></div>
+</div>
+
+<script>
+    // Paletas de colores de las curvas: 14 para la cadena serie
+    // (las cadenas de 8 y 6 reutilizan los primeros 8 y los 6 siguientes)
+    // y 8 para el paralelo
+    const coloresSerie14 = ["#F44336","#E91E63","#9C27B0","#673AB7","#3F51B5","#2196F3","#03A9F4",
+                             "#00BCD4","#009688","#4CAF50","#8BC34A","#CDDC39","#FFEB3B","#FF9800"];
+    const coloresParal   = ["#FF5722","#FF9800","#FFC107","#FFEB3B","#CDDC39","#8BC34A","#4CAF50","#009688"];
+
+    // Genera la configuración de series que espera uPlot. La primera
+    // entrada vacía corresponde al eje X (tiempo), que uPlot exige
+    function buildSeriesConfig(n, colores, prefijo) {
+        const cfg = [{}];
+        for (let i = 0; i < n; i++) cfg.push({ label: `${prefijo}${i+1}`, stroke: colores[i], width: 2 });
+        return cfg;
+    }
+
+    // Crea una instancia nueva de uPlot en el contenedor indicado, limpiando
+    // primero cualquier instancia anterior para no acumular canvas invisibles.
+    // Devuelve la gráfica y su buffer de datos: data[0] son los tiempos y
+    // data[i+1] los valores de la curva i.
+    function crearPlot(contenedorId, n, colores, prefijo) {
+        const el = document.getElementById(contenedorId);
+        el.innerHTML = '';
+        const data = Array.from({length: n + 1}, () => []);
+        const plot = new uPlot({
+            width: window.innerWidth - 60, height: 300,
+            axes: [ { stroke: "#c7d0d9", grid: { stroke: "#2c3235" } },
+                    { stroke: "#c7d0d9", grid: { stroke: "#2c3235" } } ],
+            series: buildSeriesConfig(n, colores, prefijo)
+        }, data, el);
+        return { plot, data };
+    }
+
+    // Libera los recursos de una gráfica antes de sustituirla
+    function destruirPlot(plot) {
+        if (plot && typeof plot.destroy === 'function') plot.destroy();
+    }
+
+    let plotSerie14 = null, plotSerie8 = null, plotSerie6 = null, plotParalelo = null;
+    let chartDataSerie14 = [], chartDataSerie8 = [], chartDataSerie6 = [], chartDataParalelo = [];
+
+    // Reconstruye las gráficas de la cadena serie según el modo (14 continua, u 8+6 independientes).
+    // Destruye siempre las instancias anteriores antes de crear las nuevas.
+    function reconstruirGraficasSerie(modo_serie) {
+        destruirPlot(plotSerie14); plotSerie14 = null;
+        destruirPlot(plotSerie8);  plotSerie8  = null;
+        destruirPlot(plotSerie6);  plotSerie6  = null;
+
+        // Muestra solo los paneles y gráficas del modo activo
+        const es14 = modo_serie === "14";
+        document.getElementById('panel-serie14').style.display   = es14 ? 'block' : 'none';
+        document.getElementById('panel-serie8').style.display    = es14 ? 'none' : 'block';
+        document.getElementById('panel-serie6').style.display    = es14 ? 'none' : 'block';
+        document.getElementById('chartbox-serie14').style.display = es14 ? 'block' : 'none';
+        document.getElementById('chartbox-serie8').style.display  = es14 ? 'none' : 'block';
+        document.getElementById('chartbox-serie6').style.display  = es14 ? 'none' : 'block';
+
+        if (es14) {
+            const r = crearPlot('chart-serie14', 14, coloresSerie14, 'R14_');
+            plotSerie14 = r.plot; chartDataSerie14 = r.data;
+        } else {
+            const r8 = crearPlot('chart-serie8', 8, coloresSerie14.slice(0, 8), 'R8_');
+            plotSerie8 = r8.plot; chartDataSerie8 = r8.data;
+            const r6 = crearPlot('chart-serie6', 6, coloresSerie14.slice(8, 14), 'R6_');
+            plotSerie6 = r6.plot; chartDataSerie6 = r6.data;
+        }
+    }
+
+    // Reconstruye la gráfica de paralelo según el número de canales (7 con V_REF real, 8 con V_REF fija).
+    function reconstruirGraficaParalelo(modo_paralelo) {
+        destruirPlot(plotParalelo); plotParalelo = null;
+        const n = modo_paralelo === "vref" ? 7 : 8;
+        const r = crearPlot('chart-paralelo', n, coloresParal, 'RP_');
+        plotParalelo = r.plot; chartDataParalelo = r.data;
+    }
+
+    // Origen del eje temporal de las gráficas, que se reinicia al aplicar
+    // una nueva topología. MAX_PUNTOS fija la ventana visible (~10 s a 30 Hz)
+    let startTime    = Date.now();
+    const MAX_PUNTOS = 300;
+
+    // WebSocket: window.location.host toma la IP y el puerto desde los que
+    // se sirvió la página, sin necesidad de fijar la dirección en el código
+    const ws = new WebSocket(`ws://${window.location.host}/ws`);
+    const statusEl     = document.getElementById('connection-status');
+    const gridSerie14  = document.getElementById('grid-serie14');
+    const gridSerie8   = document.getElementById('grid-serie8');
+    const gridSerie6   = document.getElementById('grid-serie6');
+    const gridParalelo = document.getElementById('grid-paralelo');
+    const hzMonitor    = document.getElementById('hz-monitor');
+
+    ws.onopen  = () => { statusEl.textContent = "Conectado (30 Hz)"; statusEl.classList.add('connected'); };
+    ws.onclose = () => { statusEl.textContent = "Desconectado"; statusEl.classList.remove('connected'); };
+
+    // Construcción inicial acorde a las opciones marcadas por defecto en el panel
+    reconstruirGraficasSerie("8_6");
+    reconstruirGraficaParalelo("vref");
+
+    // --- APLICAR TOPOLOGÍA ---
+    // Lee la posición declarada de cada jumper, la envía al servidor y
+    // reconstruye las gráficas del navegador para el nuevo modo
+    document.getElementById('btn-aplicar-topo').onclick = () => {
+        const modo_serie    = document.querySelector('input[name="modo_serie"]:checked').value;
+        const modo_paralelo = document.querySelector('input[name="modo_paralelo"]:checked').value;
+        const jp3           = document.querySelector('input[name="jp3"]:checked').value;
+        const jp4           = document.querySelector('input[name="jp4"]:checked').value;
+        const jp5           = document.querySelector('input[name="jp5"]:checked').value;
+
+        // Si la R_ref es la fija de placa se envía su valor nominal (10,1 Ω);
+        // solo se toma el campo numérico cuando se ha elegido "personalizada".
+        // JP4 solo aporta valor si está en uso; si no, se envía 0
+        const r_ref_jp3  = jp3 === "custom" ? parseFloat(document.getElementById('inp-rref-jp3').value) : 10.1;
+        const r_jp4      = jp4 !== "sin_usar" ? parseFloat(document.getElementById('inp-r-jp4').value) : 0;
+        const r_ref_jp5  = jp5 === "custom" ? parseFloat(document.getElementById('inp-rref-jp5').value) : 10.1;
+        const v_ref_fija = parseFloat(document.getElementById('inp-vref-fija').value);
+
+        ws.send(JSON.stringify({
+            accion: "configurar_topologia",
+            modo_serie, modo_paralelo, jp4, r_jp4,
+            r_ref_jp3, r_ref_jp5, v_ref_fija_paralelo: v_ref_fija
+        }));
+
+        reconstruirGraficasSerie(modo_serie);
+        reconstruirGraficaParalelo(modo_paralelo);
+        startTime = Date.now();
+    };
+
+    // --- APLICAR CANALES ---
+    // Envía cuántas resistencias se calculan y visualizan en cada modo
+    document.getElementById('btn-aplicar-canales').onclick = () => {
+        ws.send(JSON.stringify({
+            accion: "configurar_canales",
+            serie14:  parseInt(document.getElementById('inp-serie14').value),
+            serie8:   parseInt(document.getElementById('inp-serie8').value),
+            serie6:   parseInt(document.getElementById('inp-serie6').value),
+            paralelo: parseInt(document.getElementById('inp-paralelo').value),
+        }));
+    };
+
+    // --- FUNCIONES AUXILIARES DE DESCARGA Y CRONÓMETRO ---
+    // Descarga un blob como archivo mediante un enlace temporal
+    function descargar(blob, nombre) {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = nombre;
+        a.click();
+        URL.revokeObjectURL(a.href);
+    }
+
+    // Marca horaria HH-MM-SS para nombrar los archivos descargados,
+    // de modo que el CSV y los vídeos de una misma prueba puedan
+    // relacionarse por su hora
+    function timestampNombre() {
+        const n = new Date();
+        return `${String(n.getHours()).padStart(2,'0')}-${String(n.getMinutes()).padStart(2,'0')}-${String(n.getSeconds()).padStart(2,'0')}`;
+    }
+
+    // Cronómetro mm:ss que se ejecuta en el navegador, sin coste de red
+    function iniciarCronometro(idCrono) {
+        const t0 = Date.now();
+        return setInterval(() => {
+            const seg = Math.floor((Date.now() - t0) / 1000);
+            const mm  = String(Math.floor(seg / 60)).padStart(2, '0');
+            const ss  = String(seg % 60).padStart(2, '0');
+            document.getElementById(idCrono).textContent = `${mm}:${ss}`;
+        }, 1000);
+    }
+
+    function pararCronometro(intervalo, idCrono) {
+        clearInterval(intervalo);
+        document.getElementById(idCrono).textContent = '00:00';
+    }
+
+    // --- GRABACIÓN CSV ---
+    // Al iniciar, el servidor acumula filas en memoria. Al detener, envía
+    // el CSV completo por WebSocket (mensaje "csv_export", tratado en
+    // ws.onmessage) y el navegador lo descarga
+    let grabando = false, intervaloCrono = null;
+    const btnRec = document.getElementById('btn-rec');
+    const recDot = document.getElementById('rec-dot');
+
+    btnRec.onclick = () => {
+        if (!grabando) {
+            ws.send(JSON.stringify({ accion: "iniciar_grabacion" }));
+            grabando = true;
+            btnRec.textContent = "Detener Grabación";
+            btnRec.className = "btn-rec detener";
+            recDot.classList.add('activo');
+            intervaloCrono = iniciarCronometro('cronometro');
+        } else {
+            ws.send(JSON.stringify({ accion: "detener_grabacion" }));
+            grabando = false;
+            btnRec.textContent = "Iniciar Grabación";
+            btnRec.className = "btn-rec iniciar";
+            recDot.classList.remove('activo');
+            pararCronometro(intervaloCrono, 'cronometro');
+        }
+    };
+
+    // --- GRABAR PANTALLA ---
+    // Usa getDisplayMedia: el navegador pide al usuario qué pantalla o
+    // ventana compartir. La grabación se codifica en WebM y se descarga
+    // al detenerla. Independiente del servidor y de la grabación CSV
+    let pantallaGrabando = false, pantallaRecorder = null, pantallaChunks = [], pantallaCrono = null;
+    const btnPantalla = document.getElementById('btn-pantalla');
+    const dotPantalla = document.getElementById('dot-pantalla');
+
+    btnPantalla.onclick = async () => {
+        if (!pantallaGrabando) {
+            try {
+                const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: false });
+                pantallaChunks = [];
+                pantallaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+                pantallaRecorder.ondataavailable = e => { if (e.data.size > 0) pantallaChunks.push(e.data); };
+                pantallaRecorder.onstop = () => {
+                    const blob = new Blob(pantallaChunks, { type: 'video/webm' });
+                    descargar(blob, `pantalla_${timestampNombre()}.webm`);
+                    stream.getTracks().forEach(t => t.stop());
+                };
+                pantallaRecorder.start();
+                pantallaGrabando = true;
+                btnPantalla.textContent = "Detener Pantalla";
+                btnPantalla.className = "btn-rec detener";
+                dotPantalla.classList.add('activo');
+                pantallaCrono = iniciarCronometro('pantalla-crono');
+            } catch(e) { alert("No se pudo acceder a la pantalla: " + e.message); }
+        } else {
+            pantallaRecorder.stop();
+            pantallaGrabando = false;
+            btnPantalla.textContent = "Grabar Pantalla";
+            btnPantalla.className = "btn-rec iniciar";
+            dotPantalla.classList.remove('activo');
+            pararCronometro(pantallaCrono, 'pantalla-crono');
+        }
+    };
+
+    // --- GRABAR CÁMARA ---
+    // Usa getUserMedia para acceder a la cámara del equipo, con una
+    // vista previa en pantalla mientras graba. Sirve como referencia
+    // visual del paso de vehículos. Se descarga como WebM al detener.
+    // Nota: los navegadores solo permiten estas API en contexto seguro
+    // (HTTPS o localhost); en otro caso puede requerirse habilitarlas
+    // manualmente en la configuración del navegador
+    let camaraGrabando = false, camaraRecorder = null, camaraChunks = [], camaraStream = null, camaraCrono = null;
+    const btnCamara = document.getElementById('btn-camara');
+    const dotCamara = document.getElementById('dot-camara');
+    const camaraPreview = document.getElementById('camara-preview');
+
+    btnCamara.onclick = async () => {
+        if (!camaraGrabando) {
+            try {
+                camaraStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+                camaraPreview.srcObject = camaraStream;
+                camaraPreview.style.display = 'block';
+                camaraChunks = [];
+                camaraRecorder = new MediaRecorder(camaraStream, { mimeType: 'video/webm' });
+                camaraRecorder.ondataavailable = e => { if (e.data.size > 0) camaraChunks.push(e.data); };
+                camaraRecorder.onstop = () => {
+                    const blob = new Blob(camaraChunks, { type: 'video/webm' });
+                    descargar(blob, `camara_${timestampNombre()}.webm`);
+                    camaraStream.getTracks().forEach(t => t.stop());
+                    camaraPreview.style.display = 'none';
+                };
+                camaraRecorder.start();
+                camaraGrabando = true;
+                btnCamara.textContent = "Detener Cámara";
+                btnCamara.className = "btn-rec detener";
+                dotCamara.classList.add('activo');
+                camaraCrono = iniciarCronometro('camara-crono');
+            } catch(e) { alert("No se pudo acceder a la cámara: " + e.message); }
+        } else {
+            camaraRecorder.stop();
+            camaraGrabando = false;
+            btnCamara.textContent = "Grabar Cámara";
+            btnCamara.className = "btn-rec iniciar";
+            dotCamara.classList.remove('activo');
+            pararCronometro(camaraCrono, 'camara-crono');
+        }
+    };
+
+    // --- RECEPCIÓN DE MENSAJES DEL SERVIDOR ---
+    // Se ejecuta a ~30 Hz con el estado completo del sistema. Distingue
+    // dos tipos de mensaje: el CSV de una grabación finalizada (se
+    // descarga y termina) y el estado periódico (actualiza monitor de
+    // Hz, cajas numéricas y gráficas)
+    ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+
+        if (msg.tipo === "csv_export") {
+            const blob = new Blob([msg.contenido], { type: 'text/csv' });
+            descargar(blob, `datos_${timestampNombre()}.csv`);
+            return;
+        }
+
+        const data = msg;
+        const t = (Date.now() - startTime) / 1000; // tiempo relativo en segundos
+
+        hzMonitor.textContent = `A1: ${data.hz[0]} Hz | A2: ${data.hz[1]} Hz | A3: ${data.hz[2]} Hz`;
+
+        const usaSerie14 = data.modo_serie === "14";
+
+        // --- Cajas numéricas de serie ---
+        // Un canal fuera del número de activos, o con valor 0 (aún sin
+        // cálculo), se muestra como 0.00
+        if (usaSerie14) {
+            gridSerie14.innerHTML = '';
+            for (let i = 0; i < 14; i++) {
+                const val = data.serie14[i];
+                const activo = i < data.activas_serie14;
+                gridSerie14.innerHTML += `<div class="data-box">
+                    <div class="label">R14_${i+1}</div>
+                    <div class="value">${activo && val !== 0 ? val.toFixed(2) : '0.00'}</div></div>`;
+            }
+        } else {
+            gridSerie8.innerHTML = '';
+            for (let i = 0; i < 8; i++) {
+                const val = data.serie8[i];
+                const activo = i < data.activas_serie8;
+                gridSerie8.innerHTML += `<div class="data-box">
+                    <div class="label">R8_${i+1}</div>
+                    <div class="value">${activo && val !== 0 ? val.toFixed(2) : '0.00'}</div></div>`;
+            }
+            gridSerie6.innerHTML = '';
+            for (let i = 0; i < 6; i++) {
+                const val = data.serie6[i];
+                const activo = i < data.activas_serie6;
+                gridSerie6.innerHTML += `<div class="data-box">
+                    <div class="label">R6_${i+1}</div>
+                    <div class="value">${activo && val !== 0 ? val.toFixed(2) : '0.00'}</div></div>`;
+            }
+        }
+
+        // --- Cajas numéricas de paralelo ---
+        // El servidor codifica los errores como valores negativos, que
+        // ninguna resistencia real puede tomar:
+        //   -1 → canal abierto o resistencia de asfalto muy alta ("LIB")
+        //   -2 → cortocircuito o R_ref ausente ("ERR")
+        gridParalelo.innerHTML = '';
+        for (let i = 0; i < data.paralelo.length; i++) {
+            let val = data.paralelo[i];
+            let disp = val >= 0 ? val.toFixed(2) : (val === -1 ? 'LIB' : 'ERR');
+            gridParalelo.innerHTML += `<div class="data-box">
+                <div class="label">RP_${i+1}</div>
+                <div class="value">${disp}</div></div>`;
+        }
+
+        // --- Gráficas de serie ---
+        // Los canales inactivos o sin valor se añaden como null para que
+        // uPlot no dibuje una línea en cero que se confundiría con una
+        // resistencia nula real. La comprobación de longitud del buffer
+        // evita actualizar una gráfica mientras se está reconstruyendo
+        // tras un cambio de topología
+        if (usaSerie14 && plotSerie14 && chartDataSerie14.length === 15) {
+            chartDataSerie14[0].push(t);
+            for (let i = 0; i < 14; i++) {
+                chartDataSerie14[i+1].push(i < data.activas_serie14 && data.serie14[i] !== 0 ? data.serie14[i] : null);
+            }
+            // Ventana deslizante: descarta el punto más antiguo al superar el máximo
+            if (chartDataSerie14[0].length > MAX_PUNTOS) chartDataSerie14.forEach(arr => arr.shift());
+            plotSerie14.setData(chartDataSerie14);
+        } else if (!usaSerie14 && plotSerie8 && plotSerie6 && chartDataSerie8.length === 9 && chartDataSerie6.length === 7) {
+            chartDataSerie8[0].push(t);
+            for (let i = 0; i < 8; i++) {
+                chartDataSerie8[i+1].push(i < data.activas_serie8 && data.serie8[i] !== 0 ? data.serie8[i] : null);
+            }
+            if (chartDataSerie8[0].length > MAX_PUNTOS) chartDataSerie8.forEach(arr => arr.shift());
+            plotSerie8.setData(chartDataSerie8);
+
+            chartDataSerie6[0].push(t);
+            for (let i = 0; i < 6; i++) {
+                chartDataSerie6[i+1].push(i < data.activas_serie6 && data.serie6[i] !== 0 ? data.serie6[i] : null);
+            }
+            if (chartDataSerie6[0].length > MAX_PUNTOS) chartDataSerie6.forEach(arr => arr.shift());
+            plotSerie6.setData(chartDataSerie6);
+        }
+
+        // --- Gráfica de paralelo ---
+        // Solo se traza el valor si el canal está activo y es válido (>= 0).
+        // La longitud del array del servidor (7 u 8 según JP7) debe coincidir
+        // con las curvas de la gráfica; si no, se omite el cuadro
+        if (plotParalelo && chartDataParalelo.length === data.paralelo.length + 1) {
+            chartDataParalelo[0].push(t);
+            for (let i = 0; i < data.paralelo.length; i++) {
+                chartDataParalelo[i+1].push(
+                    i < data.activas_paralelo && data.paralelo[i] >= 0 ? data.paralelo[i] : null
+                );
+            }
+            if (chartDataParalelo[0].length > MAX_PUNTOS) chartDataParalelo.forEach(arr => arr.shift());
+            plotParalelo.setData(chartDataParalelo);
+        }
+    };
+</script>
+</body>
+</html>
